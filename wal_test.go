@@ -12,8 +12,7 @@ func TestWAL_WriteAndRead(t *testing.T) {
 	os.RemoveAll(dir)       // Clean up trước khi test
 	defer os.RemoveAll(dir) // Clean up sau khi test
 
-	cfg := Config{
-		WALDir:       dir,
+	opts := Options{
 		BufferSize:   4 * 1024,
 		SegmentSize:  1024 * 1024, // 1MB
 		SyncStrategy: SyncStrategyOSCache,
@@ -21,7 +20,7 @@ func TestWAL_WriteAndRead(t *testing.T) {
 	}
 
 	// 2. Init WAL
-	w, err := New(cfg)
+	w, err := Open(dir, &opts)
 	if err != nil {
 		t.Fatalf("Failed to init WAL: %v", err)
 	}
@@ -41,7 +40,7 @@ func TestWAL_WriteAndRead(t *testing.T) {
 	}
 
 	// 5. Re-open (Recovery Test)
-	w2, err := New(cfg)
+	w2, err := Open(dir, &opts)
 	if err != nil {
 		t.Fatalf("Failed to re-open WAL: %v", err)
 	}
