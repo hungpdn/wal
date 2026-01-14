@@ -28,17 +28,25 @@ const (
 	SyncStrategyOSCache SyncStrategy = 2
 )
 
-// Options holds the configuration for WAL.
-type Options struct {
+type Mode int
+
+const (
+	ModeDebug Mode = 0
+	ModeProd  Mode = 1
+)
+
+// Config holds the configuration for WAL.
+type Config struct {
 	BufferSize    int          // Buffered writes size in bytes (e.g., 4KB)
 	SegmentSize   int64        // Maximum size of each file (e.g., 10MB)
 	SegmentPrefix string       // Prefix for segment file names (e.g., "segment")
 	SyncStrategy  SyncStrategy // Sync strategy
 	SyncInterval  uint         // Sync interval in milliseconds for background sync
+	Mode          Mode
 }
 
-// DefaultOptions provides default configuration values for WAL.
-var DefaultOptions = Options{
+// DefaultConfig provides default configuration values for WAL.
+var DefaultConfig = Config{
 	BufferSize:    4 * KB,  // 4KB
 	SegmentSize:   10 * MB, // 10MB
 	SegmentPrefix: "segment",
@@ -46,19 +54,24 @@ var DefaultOptions = Options{
 	SyncInterval:  1000, // 1000ms = 1s
 }
 
-// SetDefault sets default values for any zero-value fields in the Options.
-func (cfg *Options) SetDefault() {
+// SetDefault sets default values for any zero-value fields in the Config.
+func (cfg *Config) SetDefault() {
 	if cfg.BufferSize == 0 {
-		cfg.BufferSize = DefaultOptions.BufferSize
+		cfg.BufferSize = DefaultConfig.BufferSize
 	}
-	if cfg.SegmentSize < MB {
-		cfg.SegmentSize = DefaultOptions.SegmentSize
+	if cfg.SegmentSize == 0 {
+		cfg.SegmentSize = DefaultConfig.SegmentSize
+	}
+	if cfg.Mode == ModeProd {
+		if cfg.SegmentSize < MB {
+			cfg.SegmentSize = DefaultConfig.SegmentSize
+		}
 	}
 	if cfg.SegmentPrefix == "" {
-		cfg.SegmentPrefix = DefaultOptions.SegmentPrefix
+		cfg.SegmentPrefix = DefaultConfig.SegmentPrefix
 	}
 	if cfg.SyncInterval == 0 {
-		cfg.SyncInterval = DefaultOptions.SyncInterval
+		cfg.SyncInterval = DefaultConfig.SyncInterval
 	}
 }
 

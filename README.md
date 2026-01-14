@@ -24,14 +24,15 @@ Each segment file consists of a sequence of binary encoded entries.
 
 ```Plaintext
 +-------------------+-------------------+-------------------+----------------------+
-|   CRC32 (4 bytes) |   Size (8 bytes)  |  Offset (8 bytes) |   Payload (N bytes)  |
+|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |
 +-------------------+-------------------+-------------------+----------------------+
-| Checksum of Data  | Length of Payload | Logical Position  | The actual data      |
+| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      |
 +-------------------+-------------------+-------------------+----------------------+
 ```
 
 - CRC (Cyclic Redundancy Check): Ensures data integrity.
-- Size & Offset: Enable fast reading without parsing the entire file.
+- Size: Enable fast reading without parsing the entire file.
+- SeqID: Global Sequence ID
 - Payload: The actual data.
 
 ## Installation
@@ -53,12 +54,12 @@ import (
 )
 
 func main() {
- opts := wal.Options{
+ cfg := wal.Config{
     SegmentSize:  10 * 1024 * 1024, // 10MB
     SyncStrategy: wal.SyncStrategyOSCache,
  }
 
- w, _ := wal.Open("./wal_data", &opts)
+ w, _ := wal.Open("./wal_data", &cfg)
  defer w.Close()
 
  // Write data
@@ -70,7 +71,7 @@ func main() {
 ### Reading Data (Replay)
 
 ```go
-w, _ := wal.Open("", &opts) // Auto-recovers on open
+w, _ := wal.Open("", &cfg) // Auto-recovers on open
 
 iter, _ := w.NewReader()
 defer iter.Close()
@@ -85,7 +86,7 @@ if err := iter.Err(); err != nil {
 }
 ```
 
-### Options
+### Config
 
 |Field       |Type  |Default   |Description                                         |
 |------------|------|----------|----------------------------------------------------|
@@ -93,6 +94,7 @@ if err := iter.Err(); err != nil {
 |BufferSize  |int   |4KB       |Size of the in-memory buffer.                       |
 |SyncStrategy|int   |Background|0: Background, 1: Always (Fsync), 2: OSCache (Recm).|
 |SyncInterval|uint  |1000ms    |Interval for background sync execution.             |
+|Mode        |int   |0         |0: debug, 1: prod.                                  |
 
 ### Sync Strategies
 
