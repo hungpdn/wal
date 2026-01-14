@@ -5,6 +5,9 @@ import "hash/crc32"
 const (
 	KB = 1024    // 1 Kilobyte
 	MB = KB * KB // 1 Megabyte
+
+	PermMkdir    = 0755
+	PermFileOpen = 0600
 )
 
 // SyncStrategy defines the synchronization strategy for WAL.
@@ -25,19 +28,25 @@ const (
 	SyncStrategyOSCache SyncStrategy = 2
 )
 
+type Mode int
+
+const (
+	ModeDebug Mode = 0
+	ModeProd  Mode = 1
+)
+
 // Config holds the configuration for WAL.
 type Config struct {
-	WALDir        string       // Directory to store WAL files
 	BufferSize    int          // Buffered writes size in bytes (e.g., 4KB)
 	SegmentSize   int64        // Maximum size of each file (e.g., 10MB)
 	SegmentPrefix string       // Prefix for segment file names (e.g., "segment")
 	SyncStrategy  SyncStrategy // Sync strategy
 	SyncInterval  uint         // Sync interval in milliseconds for background sync
+	Mode          Mode
 }
 
 // DefaultConfig provides default configuration values for WAL.
 var DefaultConfig = Config{
-	WALDir:        "./wal",
 	BufferSize:    4 * KB,  // 4KB
 	SegmentSize:   10 * MB, // 10MB
 	SegmentPrefix: "segment",
@@ -47,14 +56,16 @@ var DefaultConfig = Config{
 
 // SetDefault sets default values for any zero-value fields in the Config.
 func (cfg *Config) SetDefault() {
-	if cfg.WALDir == "" {
-		cfg.WALDir = DefaultConfig.WALDir
-	}
 	if cfg.BufferSize == 0 {
 		cfg.BufferSize = DefaultConfig.BufferSize
 	}
-	if cfg.SegmentSize < MB {
+	if cfg.SegmentSize == 0 {
 		cfg.SegmentSize = DefaultConfig.SegmentSize
+	}
+	if cfg.Mode == ModeProd {
+		if cfg.SegmentSize < MB {
+			cfg.SegmentSize = DefaultConfig.SegmentSize
+		}
 	}
 	if cfg.SegmentPrefix == "" {
 		cfg.SegmentPrefix = DefaultConfig.SegmentPrefix

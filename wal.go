@@ -20,13 +20,14 @@ WAL (Write-Ahead Log) Format:
 Each segment file consists of a sequence of binary encoded entries.
 
 +-------------------+-------------------+-------------------+----------------------+
-|   CRC32 (4 bytes) |   Size (8 bytes)  |  Offset (8 bytes) |   Payload (N bytes)  |
+|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |
 +-------------------+-------------------+-------------------+----------------------+
-| Checksum of Data  | Length of Payload | Logical Position  | The actual data      |
+| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      |
 +-------------------+-------------------+-------------------+----------------------+
 
 - CRC (Cyclic Redundancy Check): Ensures data integrity.
-- Size & Offset: Enable fast reading without parsing the entire file.
+- Size: Enable fast reading without parsing the entire file.
+- SeqID: Global Sequence ID
 - Payload: The actual data.
 */
 
@@ -34,8 +35,8 @@ const (
 	// Size of various components in the WAL entry header
 	crcSize    = 4
 	sizeSize   = 8
-	offsetSize = 8
-	headerSize = crcSize + sizeSize + offsetSize
+	seqIDSize  = 8
+	headerSize = crcSize + sizeSize + seqIDSize
 )
 
 var (
@@ -44,46 +45,61 @@ var (
 
 // WAL: Write-Ahead Log structure
 type WAL struct {
-	mu            sync.RWMutex   // Ensures thread safety (Concurrency)
+	mu            sync.RWMutex   // Ensures thread safety
 	dir           string         // Directory to store WAL files
 	bufferSize    int            // Size of the write buffer
-	segmentSize   int64          // Max size of each segment file
+	segmentSize   int64          // Max size of each segment file, soft limit not hard limit
 	segmentPrefix string         // Prefix for segment file names
 	activeSegment *Segment       // Current active segment for writing
 	segments      []*Segment     // List of closed segment files
 	syncStrategy  SyncStrategy   // Sync strategy
-	stopSync      chan struct{}  // Channel to stop background sync goroutine
-	wg            sync.WaitGroup // WaitGroup to wait for goroutines to finish
+	stopSync      chan struct{}  // Channel to stop background sync
+	wg            sync.WaitGroup // WaitGroup for background sync
+	lastSeqID     uint64         // Track the global sequence ID
+	bufPool       sync.Pool
 }
 
 // Segment: Represents a physical file
 type Segment struct {
-	idx    int           // Number of the segment (0, 1, 2...)
+	idx    uint64        // Number of the segment (0, 1, 2...)
 	path   string        // Path to the file
-	file   *os.File      // File descriptor
-	writer *bufio.Writer // Uses buffer to reduce system calls (High Performance)
+	file   *os.File      // File descriptor (Active only)
+	writer *bufio.Writer // Buffered writer (Active only)
 	size   int64         // Current size of the file
 }
 
-// NewWAL: Initialize and recover data
-func New(cfg Config) (*WAL, error) {
+type segmentFile struct {
+	name string
+	idx  uint64
+}
+
+// Open: Initialize and recover data
+func Open(dir string, cfg *Config) (*WAL, error) {
 
 	// Ensure WAL directory exists
-	if err := os.MkdirAll(cfg.WALDir, 0755); err != nil {
+	if err := os.MkdirAll(dir, PermMkdir); err != nil {
 		return nil, err
 	}
 
 	// Load default config values if not set
+	if cfg == nil {
+		cfg = &DefaultConfig
+	}
 	cfg.SetDefault()
 
 	// Initialize WAL structure
 	wal := WAL{
-		dir:           cfg.WALDir,
+		dir:           dir,
 		bufferSize:    cfg.BufferSize,
 		segmentSize:   cfg.SegmentSize,
 		segmentPrefix: cfg.SegmentPrefix,
 		syncStrategy:  cfg.SyncStrategy,
 		stopSync:      make(chan struct{}),
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 4*KB+headerSize)
+			},
+		},
 	}
 
 	// Load existing segments from disk for recovery
@@ -91,8 +107,7 @@ func New(cfg Config) (*WAL, error) {
 		return nil, err
 	}
 
-	// Only run background sync if necessary
-	// If the SyncStrategyAlways, we skip it to save CPU
+	// Only run background sync if not SyncStrategyAlways
 	if wal.syncStrategy != SyncStrategyAlways {
 		wal.wg.Add(1)
 		go wal.backgroundSync(time.Duration(cfg.SyncInterval) * time.Millisecond)
@@ -110,45 +125,54 @@ func (w *WAL) loadSegments() error {
 		return err
 	}
 
-	// Filter segment files based on prefix and suffix
-	var segFiles []string
+	// Parse the filename and index it into a temporary struct
+	var segFiles []segmentFile
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), fmt.Sprintf("%s-", w.segmentPrefix)) && strings.HasSuffix(e.Name(), ".wal") {
-			segFiles = append(segFiles, e.Name())
+		if strings.HasPrefix(e.Name(), fmt.Sprintf("%s-", w.segmentPrefix)) &&
+			strings.HasSuffix(e.Name(), ".wal") {
+
+			// Parse ID from file name
+			var idx uint64
+			cleanName := strings.TrimPrefix(e.Name(), w.segmentPrefix+"-")
+			cleanName = strings.TrimSuffix(cleanName, ".wal")
+
+			// Scan integer number
+			if _, err := fmt.Sscanf(cleanName, "%d", &idx); err == nil {
+				segFiles = append(segFiles, segmentFile{name: e.Name(), idx: idx})
+			}
 		}
 	}
 
-	// Sort to ensure log order
-	sort.Strings(segFiles)
+	// Sort by Index (Integer Sort)
+	sort.Slice(segFiles, func(i, j int) bool {
+		return segFiles[i].idx < segFiles[j].idx
+	})
 
 	// If no segment files exist, create the first one
 	if len(segFiles) == 0 {
 		return w.createActiveSegment(0)
 	}
 
-	// Reopen old segments
-	for i, name := range segFiles {
-		path := filepath.Join(w.dir, name)
-		f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0600)
+	for i, fileObj := range segFiles {
+		path := filepath.Join(w.dir, fileObj.name)
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, PermFileOpen)
 		if err != nil {
 			return err
 		}
 
-		// Get current size to determine offset
 		stat, err := f.Stat()
 		if err != nil {
 			return err
 		}
 
-		// Create Segment struct
 		seg := &Segment{
-			idx:  i,
+			idx:  fileObj.idx,
 			path: path,
 			file: f,
 			size: stat.Size(),
 		}
 
-		// If it's the last file (Active Segment), we need to check for consistency
+		// If it's the last file, set as active
 		if i == len(segFiles)-1 {
 			// Seek to the end of the file
 			if _, err := f.Seek(0, io.SeekEnd); err != nil {
@@ -159,7 +183,7 @@ func (w *WAL) loadSegments() error {
 
 			// Important: Repair the last file if corrupted due to crash
 			if err := w.repairActiveSegment(); err != nil {
-				return fmt.Errorf("corrupted segment repair failed: %v", err)
+				return err
 			}
 		} else {
 			// Close old segment files
@@ -167,7 +191,50 @@ func (w *WAL) loadSegments() error {
 			w.segments = append(w.segments, seg)
 		}
 	}
+
+	// SPECIAL CASE: If active segment is empty (newly rotated before crash),
+	// we need to find lastSeqID from the previous closed segment.
+	if w.activeSegment.size == 0 && len(w.segments) > 0 {
+		lastClosedSeg := w.segments[len(w.segments)-1]
+		lastID, err := w.scanSegmentForLastID(lastClosedSeg.path)
+		if err != nil {
+			return fmt.Errorf("failed to recover SeqID from previous segment: %v", err)
+		}
+		w.lastSeqID = lastID
+	}
 	return nil
+}
+
+// scanSegmentForLastID reads a closed segment to find the highest SeqID.
+// This is only called once at startup if the active segment is empty.
+func (w *WAL) scanSegmentForLastID(path string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	var lastID uint64
+
+	for {
+		header := make([]byte, headerSize)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return 0, err
+		}
+		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
+		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+		lastID = seqID
+
+		// Skip payload
+		if _, err := reader.Discard(int(size)); err != nil {
+			return 0, err
+		}
+	}
+	return lastID, nil
 }
 
 // repairActiveSegment: Repair the active segment file if corrupted
@@ -176,7 +243,6 @@ func (w *WAL) loadSegments() error {
 func (w *WAL) repairActiveSegment() error {
 
 	f := w.activeSegment.file
-
 	// Read from the beginning
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -184,13 +250,14 @@ func (w *WAL) repairActiveSegment() error {
 
 	reader := bufio.NewReader(f)
 	var validOffset int64 = 0
+	var maxSeqID uint64 = 0
 
 	for {
 		// Read Header (CRC + Size + Offset)
 		header := make([]byte, headerSize)
 		if _, err := io.ReadFull(reader, header); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break // End of file or truncated file -> Stop
+				break
 			}
 			return err
 		}
@@ -198,27 +265,27 @@ func (w *WAL) repairActiveSegment() error {
 		// Parse Header
 		readCrc := binary.BigEndian.Uint32(header[:crcSize])
 		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
-		offset := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
 
 		// Read Payload
 		payload := make([]byte, size)
 		if _, err := io.ReadFull(reader, payload); err != nil {
-			break // Payload read error -> Stop
-		}
-
-		// Verify CRC
-		verifyBuf := make([]byte, sizeSize+offsetSize+len(payload))
-		binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
-		binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+offsetSize], offset)
-		copy(verifyBuf[sizeSize+offsetSize:], payload)
-
-		if calculateCRC(verifyBuf) != readCrc {
-			log.Println("⚠️ Detected corrupted data due to crash -> Will truncate.")
 			break
 		}
 
-		// Valid record, update offset safely
+		// Verify CRC
+		verifyBuf := make([]byte, sizeSize+seqIDSize+len(payload))
+		binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
+		binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+seqIDSize], seqID)
+		copy(verifyBuf[sizeSize+seqIDSize:], payload)
+
+		if calculateCRC(verifyBuf) != readCrc {
+			log.Println("⚠️ WAL: Corrupted tail detected, truncating...")
+			break
+		}
+
 		validOffset += int64(headerSize + size)
+		maxSeqID = seqID
 	}
 
 	// Truncate file to the last valid position
@@ -232,12 +299,13 @@ func (w *WAL) repairActiveSegment() error {
 	}
 	w.activeSegment.size = validOffset
 	w.activeSegment.writer = bufio.NewWriterSize(f, w.bufferSize) // Reset buffer writer
+	w.lastSeqID = maxSeqID                                        // Update global state
 
 	return nil
 }
 
 // createActiveSegment: Create a new active segment
-func (w *WAL) createActiveSegment(idx int) error {
+func (w *WAL) createActiveSegment(idx uint64) error {
 
 	// sync and close old segment if exists
 	if w.activeSegment != nil {
@@ -257,9 +325,17 @@ func (w *WAL) createActiveSegment(idx int) error {
 	path := filepath.Join(w.dir, fileName)
 
 	// Open file with 0600 permissions (read/write for owner only) -> Security
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, PermFileOpen)
 	if err != nil {
 		return err
+	}
+
+	// Sync parent directory
+	// The file has been synced, but its entry in the parent directory may not have been synced to disk
+	// If the power goes out at the moment the new file is created, that file may disappear completely
+	if dir, err := os.Open(w.dir); err == nil {
+		dir.Sync() // Ensure that the entry for the new file is written to the directory table
+		dir.Close()
 	}
 
 	w.activeSegment = &Segment{
@@ -275,7 +351,6 @@ func (w *WAL) createActiveSegment(idx int) error {
 // backgroundSync: Periodically sync data based on strategy
 func (w *WAL) backgroundSync(interval time.Duration) {
 	defer w.wg.Done()
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -291,42 +366,72 @@ func (w *WAL) backgroundSync(interval time.Duration) {
 				}
 
 			case SyncStrategyOSCache:
-				// --- OPTIMIZED LOCKING ---
-
-				// Lock only to get the file pointer (Extremely short)
+				// Minimized Lock Contention
 				w.mu.Lock()
 				if w.activeSegment == nil || w.activeSegment.file == nil {
-					w.mu.Unlock() // Nothing to sync
+					w.mu.Unlock()
 					continue
 				}
 				// Copy file pointer to local variable
 				f := w.activeSegment.file
-				w.mu.Unlock() // <--- RELEASE LOCK IMMEDIATELY
+				w.mu.Unlock()
 
-				// Perform heavy I/O outside of Lock
-				// At this point, other Goroutines (Write) can acquire Lock and write logs normally
 				err := f.Sync()
-
-				// Troubleshooting (Race condition with Rotate/Close)
-				if err != nil {
-					// If the file is closed (due to the rotate file closing), we ignore this error
-					if errors.Is(err, os.ErrClosed) {
-						continue
-					}
-					// Other errors will be logged as warnings
-					log.Printf("wal: background sync os_cache warning: %v", err)
+				if err != nil && !errors.Is(err, os.ErrClosed) {
+					log.Printf("wal: background sync error: %v", err)
 				}
-				// -------------------------
 
 			default:
 				// do nothing
 			}
 
 		case <-w.stopSync:
-			log.Println("wal: stopping sync routine...")
 			return
 		}
 	}
+}
+
+func (w *WAL) bufferWrite(payload []byte) error {
+	w.lastSeqID++
+
+	pktSize := int64(headerSize + len(payload))
+	payloadLen := uint64(len(payload))
+
+	currentSeqID := w.lastSeqID
+
+	var buf []byte
+	obj := w.bufPool.Get()
+	if b, ok := obj.([]byte); ok && int64(cap(b)) >= pktSize {
+		buf = b[:pktSize]
+	} else {
+		buf = make([]byte, pktSize)
+	}
+
+	// [CRC][Size][SeqID][Payload]
+	binary.BigEndian.PutUint64(buf[crcSize:crcSize+sizeSize], payloadLen)
+	binary.BigEndian.PutUint64(buf[crcSize+sizeSize:headerSize], currentSeqID)
+	copy(buf[headerSize:], payload)
+
+	checksum := calculateCRC(buf[crcSize:])
+	binary.BigEndian.PutUint32(buf[:crcSize], checksum)
+
+	if _, err := w.activeSegment.writer.Write(buf); err != nil {
+		return err
+	}
+
+	w.bufPool.Put(buf)
+	w.activeSegment.size += pktSize
+	return nil
+}
+
+func (w *WAL) runSyncStrategy() error {
+	switch w.syncStrategy {
+	case SyncStrategyAlways:
+		return w.sync()
+	case SyncStrategyOSCache:
+		return w.activeSegment.writer.Flush()
+	}
+	return nil
 }
 
 // Write: Append a new entry to the WAL
@@ -334,76 +439,55 @@ func (w *WAL) Write(payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Prepare Header
-	// Total size of entry = Header + Payload
 	pktSize := int64(headerSize + len(payload))
-	// Check Log Rotation
 	if w.activeSegment.size+pktSize > w.segmentSize {
 		if err := w.createActiveSegment(w.activeSegment.idx + 1); err != nil {
 			return err
 		}
 	}
 
-	payloadLen := uint64(len(payload))
-	currentOffset := uint64(w.activeSegment.size)
-
-	// Prepare Buffer
-	buf := make([]byte, pktSize)
-
-	// Encoding Binary
-	// Format: [CRC][Size][Offset][Payload] -> Calculate CRC over
-	binary.BigEndian.PutUint64(buf[crcSize:crcSize+sizeSize], payloadLen)
-	binary.BigEndian.PutUint64(buf[crcSize+sizeSize:headerSize], currentOffset)
-	copy(buf[headerSize:], payload)
-
-	// Calculate CRC
-	checksum := calculateCRC(buf[crcSize:])
-	binary.BigEndian.PutUint32(buf[:crcSize], checksum)
-
-	// Write to buffered writer first (Go RAM)
-	if _, err := w.activeSegment.writer.Write(buf); err != nil {
+	if err := w.bufferWrite(payload); err != nil {
 		return err
 	}
 
-	// Sync based on strategy
-	switch w.syncStrategy {
+	return w.runSyncStrategy()
+}
 
-	case SyncStrategyAlways: // safest
+// WriteBatch writes a batch of entries to the WAL efficiently.
+// It acquires the lock once and syncs once (if needed) for the whole batch.
+func (w *WAL) WriteBatch(payloads [][]byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-		if err := w.sync(); err != nil {
-			return err
-		}
-
-	case SyncStrategyOSCache: // fast, safe with app crash
-		// Push to OS
-		// Syncing is handled by the background goroutine every 1 second
-		if err := w.activeSegment.writer.Flush(); err != nil {
-			return err
-		}
-
-	case SyncStrategyBackground: // high risk, super fast
-		// do nothing
+	var batchSize int64
+	for _, p := range payloads {
+		batchSize += int64(headerSize + len(p))
 	}
 
-	// Update Offset for next write
-	w.activeSegment.size += pktSize
+	if w.activeSegment.size+batchSize > w.segmentSize {
+		if err := w.createActiveSegment(w.activeSegment.idx + 1); err != nil {
+			return err
+		}
+	}
 
-	return nil
+	for _, payload := range payloads {
+		if err := w.bufferWrite(payload); err != nil {
+			return err
+		}
+	}
+
+	return w.runSyncStrategy()
 }
 
 // sync: Flush buffer and fsync to disk
 // Internal method, caller must hold the lock
 func (w *WAL) sync() error {
-
 	if w.activeSegment == nil {
 		return nil
 	}
-
-	// Flush buffer Go -> OS
 	if err := w.activeSegment.writer.Flush(); err != nil {
 		return err
 	}
-	// Fsync OS -> Disk Platter (Mandatory for Durability)
 	return w.activeSegment.file.Sync()
 }
 
@@ -412,184 +496,146 @@ func (w *WAL) sync() error {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	return w.sync()
 }
 
 // StopSync stops sync goroutine and WAITS for it to finish
 func (w *WAL) StopSync() {
-	// Check the channel to avoid closing on nil or closing twice (if more thorough, use sync.Once)
 	select {
 	case <-w.stopSync:
-		// The channel is closed, it's not doing anything
 	default:
-		// If not closed yet, close it to signal stop
 		if w.stopSync != nil {
 			close(w.stopSync)
 		}
 	}
-
-	// Block here until backgroundSync actually returns.
 	w.wg.Wait()
 }
 
 // Close: Safely close the WAL
 func (w *WAL) Close() error {
 	w.mu.Lock()
-	// Sync data last time
 	if err := w.sync(); err != nil {
 		w.mu.Unlock()
 		return err
 	}
 	w.mu.Unlock() // <--- IMPORTANT: Release the lock so that BackgroundSync can finish running (if it's stuck).
 
-	// Stop the background worker (This function has wg.Wait, so it must be called when the lock is not held)
 	w.StopSync()
 
-	// Lock the file to close it securely
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.activeSegment.file.Close()
 }
 
-// Reader: Interface to read logs sequentially
-type Reader interface {
-	Next() bool    // Move to the next log
-	Value() []byte // Get the data of the current log
-	Err() error    // Get error if any
-	Close() error  // Close the reader
-}
-
-// Iterator: Implementation of Reader
-type Iterator struct {
-	wal           *WAL
-	segmentPaths  []string   // List of segment file paths
-	currentIdx    int        // Index of the current segment file being read
-	currentFile   *os.File   // File descriptor currently open
-	currentReader *io.Reader // Reader wrapper (could be buffered)
-	currentEntry  []byte     // Current log entry data
-	err           error      // Error if any
-	closed        bool       // Whether the iterator is closed
-}
-
-// NewReader: Create an Iterator starting from the oldest segment
-func (w *WAL) NewReader() (*Iterator, error) {
+func (w *WAL) GetLastSegmentIdx() uint64 {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	// Combine all segment files (including closed and active files)
-	var paths []string
-	for _, seg := range w.segments {
-		paths = append(paths, seg.path)
-	}
-	// Don't forget the active file (the last one)
-	if w.activeSegment != nil {
-		paths = append(paths, w.activeSegment.path)
+	if w.activeSegment == nil {
+		return 0
 	}
 
-	return &Iterator{
-		wal:          w,
-		segmentPaths: paths,
-		currentIdx:   0,
-		currentFile:  nil, // Will open lazy in Next()
-	}, nil
+	return w.activeSegment.idx
 }
 
-// Next: Read the next entry. Returns true if successful, false if no more data or error.
-func (it *Iterator) Next() bool {
-	if it.err != nil || it.closed {
-		return false
+// TruncateFront deletes all closed segments with an index less than the provided index.
+// This is used to free up disk space after a snapshot has been taken.
+// Note: This does not affect the active segment.
+func (w *WAL) TruncateFront(segmentIdx uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var keptSegments []*Segment
+	for _, seg := range w.segments {
+		if seg.idx < segmentIdx {
+			// Remove the file from disk
+			if err := os.Remove(seg.path); err != nil {
+				// If the file is already gone, ignore the error
+				if !os.IsNotExist(err) {
+					return err
+				}
+			}
+		} else {
+			keptSegments = append(keptSegments, seg)
+		}
 	}
 
-	// Loop to handle switching between segment files
-	for {
-		// If file is not opened or we've read all of the old file -> Open new file
-		if it.currentFile == nil {
-			if it.currentIdx >= len(it.segmentPaths) {
-				return false // All files have been read
-			}
+	// Update the segment list
+	w.segments = keptSegments
+	return nil
+}
 
-			path := it.segmentPaths[it.currentIdx]
-			f, err := os.Open(path)
-			if err != nil {
-				it.err = err
-				return false
-			}
+// Cleanup removes closed segments that are older than the specified TTL (Time To Live).
+// This is useful for time-based retention policies.
+func (w *WAL) CleanupByTTL(ttl time.Duration) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-			it.currentFile = f
-			// Create a buffer reader for faster reading
-			br := bufio.NewReader(f)
-			reader := io.Reader(br)
-			it.currentReader = &reader
-		}
+	threshold := time.Now().Add(-ttl)
+	var keptSegments []*Segment
 
-		// Read Header
-		header := make([]byte, headerSize)
-		_, err := io.ReadFull(*it.currentReader, header)
-
+	for _, seg := range w.segments {
+		// Get file stats to check modification time
+		info, err := os.Stat(seg.path)
 		if err != nil {
-			// If EOF is encountered, close the current file and increment the index so that the next iteration opens a new file
-			if err == io.EOF {
-				it.currentFile.Close()
-				it.currentFile = nil
-				it.currentIdx++
+			// If file doesn't exist, skip it (it's essentially cleaned)
+			if os.IsNotExist(err) {
 				continue
 			}
-			// If unexpected error occurs (UnexpectedEOF) -> Report error
-			it.err = err
-			return false
+			// If we can't stat it for some other reason, keep it to be safe
+			keptSegments = append(keptSegments, seg)
+			continue
 		}
 
-		// Parse Header
-		// Note: This must match the structure used when writing within the Write function
-		readCrc := binary.BigEndian.Uint32(header[:crcSize])
-		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
-		// offset := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize]) // It can be used for debugging
-
-		// Read Payload
-		payload := make([]byte, size)
-		if _, err := io.ReadFull(*it.currentReader, payload); err != nil {
-			it.err = err
-			return false
+		// If the file is older than the threshold, delete it
+		if info.ModTime().Before(threshold) {
+			if err := os.Remove(seg.path); err != nil {
+				if !os.IsNotExist(err) {
+					return err
+				}
+			}
+		} else {
+			keptSegments = append(keptSegments, seg)
 		}
-
-		// Verify CRC
-		// Create a buffer to recalculate CRC (Size + Offset + Payload)
-		// Note: When writing, you calculate CRC for (Buf[crcSize:]), which includes both Size and Offset
-		verifyBuf := make([]byte, sizeSize+offsetSize+len(payload))
-		copy(verifyBuf[:sizeSize+offsetSize], header[crcSize:]) // Copy Size + Offset from header
-		copy(verifyBuf[sizeSize+offsetSize:], payload)          // Copy Payload
-
-		// Use Castagnoli table to match config.go
-		if calculateCRC(verifyBuf) != readCrc {
-			it.err = fmt.Errorf("wal: corrupted data (crc mismatch) at segment %s", it.segmentPaths[it.currentIdx])
-			return false
-		}
-
-		// Finish
-		it.currentEntry = payload
-		return true
 	}
+
+	w.segments = keptSegments
+	return nil
 }
 
-// Value: Get the data of the current log entry
-func (it *Iterator) Value() []byte {
-	// Return a copy for safety, or return the original slice if you want zero-allocation (be careful)
-	out := make([]byte, len(it.currentEntry))
-	copy(out, it.currentEntry)
-	return out
-}
+// CleanupBySize removes old segments if the total WAL size exceeds maxSizeBytes.
+// It deletes from the oldest segment until the total size is within the limit.
+func (w *WAL) CleanupBySize(maxSizeBytes int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-// Err: Returns an error if the browsing process is interrupted
-func (it *Iterator) Err() error {
-	return it.err
-}
+	var totalSize int64
+	for _, seg := range w.segments {
+		totalSize += seg.size
+	}
+	if w.activeSegment != nil {
+		totalSize += w.activeSegment.size
+	}
 
-// Close: Close the current file and release its resources
-func (it *Iterator) Close() error {
-	it.closed = true
-	if it.currentFile != nil {
-		return it.currentFile.Close()
+	if totalSize <= maxSizeBytes {
+		return nil
+	}
+
+	var deleteCount int
+	for _, seg := range w.segments {
+		if totalSize > maxSizeBytes {
+			if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			totalSize -= seg.size
+			deleteCount++
+		} else {
+			break
+		}
+	}
+
+	if deleteCount > 0 {
+		w.segments = w.segments[deleteCount:]
 	}
 	return nil
 }
