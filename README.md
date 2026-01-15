@@ -23,17 +23,18 @@ A high-performance, concurrent-safe, and crash-resilient **Write-Ahead Log (WAL)
 Each segment file consists of a sequence of binary encoded entries.
 
 ```Plaintext
-+-------------------+-------------------+-------------------+----------------------+
-|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |
-+-------------------+-------------------+-------------------+----------------------+
-| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      |
-+-------------------+-------------------+-------------------+----------------------+
++-------------------+-------------------+-------------------+----------------------+-------------------+
+|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |   Size (8 bytes)  |
++-------------------+-------------------+-------------------+----------------------+-------------------+
+| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      | Backward Pointer  |
++-------------------+-------------------+-------------------+----------------------+-------------------+
 ```
 
 - CRC (Cyclic Redundancy Check): Ensures data integrity.
 - Size: Enable fast reading without parsing the entire file.
 - SeqID: Global Sequence ID
 - Payload: The actual data.
+- Size (Footer): Enable fast reverse reading (Startup Optimization).
 
 ## Installation
 

@@ -64,7 +64,6 @@ func (it *Iterator) Next() bool {
 
 	// Loop to handle switching between segment files
 	for {
-		// If file is not opened or we've read all of the old file -> Open new file
 		if it.currentFile == nil {
 			if it.currentIdx >= len(it.segmentPaths) {
 				return false // All files have been read
@@ -73,15 +72,11 @@ func (it *Iterator) Next() bool {
 			path := it.segmentPaths[it.currentIdx]
 			f, err := os.Open(path)
 			if err != nil {
-				// If file is deleted (e.g. retention policy), we report error
-				// or we could skip it using it.currentIdx++ (data loss scenario)
-				// For strict consistency, we return error.
 				it.err = err
 				return false
 			}
 
 			it.currentFile = f
-			// Create a buffer reader for faster reading
 			br := bufio.NewReader(f)
 			reader := io.Reader(br)
 			it.currentReader = &reader
@@ -92,14 +87,12 @@ func (it *Iterator) Next() bool {
 		_, err := io.ReadFull(*it.currentReader, header)
 
 		if err != nil {
-			// If EOF is encountered, close the current file and increment the index so that the next iteration opens a new file
 			if err == io.EOF {
 				it.currentFile.Close()
 				it.currentFile = nil
 				it.currentIdx++
 				continue
 			}
-			// If unexpected error occurs (UnexpectedEOF) -> Report error
 			it.err = err
 			return false
 		}
@@ -110,6 +103,12 @@ func (it *Iterator) Next() bool {
 
 		payload := make([]byte, size)
 		if _, err := io.ReadFull(*it.currentReader, payload); err != nil {
+			it.err = err
+			return false
+		}
+
+		// Skip Footer (8 bytes)
+		if _, err := io.CopyN(io.Discard, *it.currentReader, int64(footerSize)); err != nil {
 			it.err = err
 			return false
 		}
@@ -143,7 +142,6 @@ func (it *Iterator) Index() uint64 {
 
 // Value: Get the data of the current log entry
 func (it *Iterator) Value() []byte {
-	// Return a copy for safety, or return the original slice if you want zero-allocation (be careful)
 	out := make([]byte, len(it.currentEntry))
 	copy(out, it.currentEntry)
 	return out
@@ -164,10 +162,8 @@ func (it *Iterator) Close() error {
 }
 
 // Seek: Fast-forward to the record with ID >= startID
-// It will skip reading the payload and verifying the CRC of older records
 func (it *Iterator) Seek(startID uint64) bool {
 	for {
-
 		if it.currentFile == nil {
 			if it.currentIdx >= len(it.segmentPaths) {
 				return false
@@ -200,16 +196,22 @@ func (it *Iterator) Seek(startID uint64) bool {
 		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
 
 		if seqID < startID {
-			// Use Discard to jump over byte 'size' without copying the data
-			if _, err := io.CopyN(io.Discard, *it.currentReader, int64(size)); err != nil {
+			// Skip payload + footer efficiently
+			if _, err := io.CopyN(io.Discard, *it.currentReader, int64(size)+int64(footerSize)); err != nil {
 				it.err = err
 				return false
 			}
 			continue
 		} else {
-
+			// Read Payload
 			payload := make([]byte, size)
 			if _, err := io.ReadFull(*it.currentReader, payload); err != nil {
+				it.err = err
+				return false
+			}
+
+			// Read and discard footer
+			if _, err := io.CopyN(io.Discard, *it.currentReader, int64(footerSize)); err != nil {
 				it.err = err
 				return false
 			}
