@@ -214,14 +214,23 @@ func TestWAL_Cleanup(t *testing.T) {
 		t.Skip("Not enough files generated for Cleanup test")
 	}
 
-	// Call TruncateFront with index 1 (should keep 1 and greater, delete 0)
-	err := w.TruncateFront(1)
+	// Test TruncateFront with SeqID
+	// We want to remove the first segment (StartID 1) but keep the second (StartID ~21).
+	// If we call TruncateFront(30), it finds the last segment with StartID <= 30.
+	// That would be the 2nd segment (StartID ~21).
+	// So it keeps 2nd segment and deletes the 1st.
+	err := w.TruncateFront(30)
 	if err != nil {
 		t.Errorf("TruncateFront failed: %v", err)
 	}
 
-	// 2. Test CleanupBySize
-	// Limit total size to ~500 bytes (should keep only active + maybe 1 closed)
+	// Check that we deleted something
+	remainingFiles, _ := os.ReadDir(dir)
+	if len(remainingFiles) >= len(initialFiles) {
+		t.Errorf("Expected fewer files, got %d vs %d", len(remainingFiles), len(initialFiles))
+	}
+
+	// CleanupBySize check)
 	err = w.CleanupBySize(600)
 	if err != nil {
 		t.Errorf("CleanupBySize failed: %v", err)

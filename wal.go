@@ -63,11 +63,12 @@ type WAL struct {
 
 // Segment: Represents a physical file
 type Segment struct {
-	idx    uint64        // Number of the segment (0, 1, 2...)
-	path   string        // Path to the file
-	file   *os.File      // File descriptor (Active only)
-	writer *bufio.Writer // Buffered writer (Active only)
-	size   int64         // Current size of the file
+	idx     uint64        // Number of the segment (0, 1, 2...)
+	path    string        // Path to the file
+	file    *os.File      // File descriptor (Active only)
+	writer  *bufio.Writer // Buffered writer (Active only)
+	size    int64         // Current size of the file
+	startID uint64        // The first SeqID in this segment
 }
 
 type segmentFile struct {
@@ -168,11 +169,21 @@ func (w *WAL) loadSegments() error {
 			return err
 		}
 
+		// Read the first block to get StartID
+		var startID uint64 = 0
+		if stat.Size() >= int64(headerSize) {
+			header := make([]byte, headerSize)
+			if _, err := f.ReadAt(header, 0); err == nil {
+				startID = binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+			}
+		}
+
 		seg := &Segment{
-			idx:  fileObj.idx,
-			path: path,
-			file: f,
-			size: stat.Size(),
+			idx:     fileObj.idx,
+			path:    path,
+			file:    f,
+			size:    stat.Size(),
+			startID: startID,
 		}
 
 		// If it's the last file, set as active
@@ -205,6 +216,12 @@ func (w *WAL) loadSegments() error {
 		}
 		w.lastSeqID = lastID
 	}
+
+	// Ensure active segment has correct StartID if it was empty/new
+	if w.activeSegment.startID == 0 {
+		w.activeSegment.startID = w.lastSeqID + 1
+	}
+
 	return nil
 }
 
@@ -217,7 +234,7 @@ func (w *WAL) scanSegmentForLastID(path string) (uint64, error) {
 	}
 	defer f.Close()
 
-	// Optimized: Try reverse scan first
+	// 1. Reverse Check
 	stat, err := f.Stat()
 	if err != nil {
 		return 0, err
@@ -242,7 +259,7 @@ func (w *WAL) scanSegmentForLastID(path string) (uint64, error) {
 		}
 	}
 
-	// Fallback to sequential scan
+	// 2. Sequential Fallback
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
@@ -278,14 +295,13 @@ func (w *WAL) repairActiveSegment() error {
 	}
 	fileSize := stat.Size()
 
-	// Empty file is valid
 	if fileSize == 0 {
 		w.activeSegment.size = 0
 		w.lastSeqID = 0 // Will be fixed by loadSegments if previous segments exist
 		return nil
 	}
 
-	// 1. Attempt Reverse Recovery (Optimization)
+	// 1. Reverse Recovery
 	if fileSize >= int64(headerSize+footerSize) {
 		// Read Footer (Last 8 bytes)
 		footer := make([]byte, footerSize)
@@ -328,7 +344,7 @@ func (w *WAL) repairActiveSegment() error {
 		}
 	}
 
-	// 2. Fallback: If reverse check fails (corrupted tail or file too small), do full scan
+	// 2. Fallback: Sequential repair
 	log.Println("WAL: Fast startup failed or corruption detected. Falling back to sequential repair...")
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -436,11 +452,12 @@ func (w *WAL) createActiveSegment(idx uint64) error {
 	}
 
 	w.activeSegment = &Segment{
-		idx:    idx,
-		path:   path,
-		file:   f,
-		writer: bufio.NewWriterSize(f, w.bufferSize),
-		size:   0,
+		idx:     idx,
+		path:    path,
+		file:    f,
+		writer:  bufio.NewWriterSize(f, w.bufferSize),
+		size:    0,
+		startID: w.lastSeqID + 1,
 	}
 	return nil
 }
@@ -642,18 +659,43 @@ func (w *WAL) GetLastSegmentIdx() uint64 {
 	return w.activeSegment.idx
 }
 
-// TruncateFront deletes all closed segments with an index less than the provided index.
-func (w *WAL) TruncateFront(segmentIdx uint64) error {
+// TruncateFront removes all closed segments that contain NO entries with ID >= minSeqID.
+// Example:
+// Seg1: Start=1.  Seg2: Start=100. Seg3: Start=200.
+// TruncateFront(150):
+// Seg1 <= 150. Candidate.
+// Seg2 <= 150. Better Candidate.
+// Seg3 > 150. Stop.
+// Result: Keep Seg2, Seg3. Delete Seg1.
+func (w *WAL) TruncateFront(minSeqID uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	var pivotIdx int = -1
+	for i, seg := range w.segments {
+		if seg.startID <= minSeqID {
+			pivotIdx = i
+		} else {
+			break
+		}
+	}
+
+	// Check if active segment covers minSeqID entirely (meaning all closed segments are old)
+	if w.activeSegment != nil && w.activeSegment.startID <= minSeqID {
+		pivotIdx = len(w.segments)
+	}
+
+	if pivotIdx == -1 {
+		return nil // All segments are newer than minSeqID (or list empty), nothing to delete
+	}
+
+	// Delete segments from index 0 to pivotIdx-1
+	// KEEP the pivotIdx because it contains logs that start before minSeqID but might end after it
 	var keptSegments []*Segment
-	for _, seg := range w.segments {
-		if seg.idx < segmentIdx {
-			if err := os.Remove(seg.path); err != nil {
-				if !os.IsNotExist(err) {
-					return err
-				}
+	for i, seg := range w.segments {
+		if i < pivotIdx {
+			if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+				return err
 			}
 		} else {
 			keptSegments = append(keptSegments, seg)

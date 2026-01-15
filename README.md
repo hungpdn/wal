@@ -14,7 +14,17 @@ A high-performance, concurrent-safe, and crash-resilient **Write-Ahead Log (WAL)
 - 🔄 **Log Rotation**: Automatic segment rotation based on configurable size.
 - 💾 **Flexible Sync Strategies**: Choose between Performance (Background), Safety (Always), or Balance (OSCache).
 - 🔍 **Iterator API**: Memory-efficient sequential reading of logs.
-- 🧵 **Crash Safety:** Automatic recovery from power failures. Detects and truncates corrupted log tails (partial writes) on startup.
+- ⚡ **Optimized Startup**: Uses reverse scanning to instantly recover the last segment state without reading the whole file.
+- 🧹 **Retention Policies**: Automatic cleanup based on TTL (Time-To-Live) or Total Size.
+
+## Roadmap
+
+The following features are planned for future releases:
+
+- [ ] **v0.1.1 - Compression Support**: Add Snappy/Zstd compression for payloads to reduce disk usage.
+- [ ] **v0.1.2 - Sparse Indexing**: Implement a sidecar `.idx` file to support O(1) lookup time for `Seek(SeqID)`.
+- [ ] **v0.1.3 - Metrics & Observability**: OpenTelemetry / Prometheus integration for monitoring throughput and latency.
+- [ ] **v0.2.0 - Replication Hooks**: APIs to support streaming WAL entries to other nodes (Raft/Paxos integration).
 
 ## Architecture
 
@@ -31,10 +41,10 @@ Each segment file consists of a sequence of binary encoded entries.
 ```
 
 - CRC (Cyclic Redundancy Check): Ensures data integrity.
-- Size: Enable fast reading without parsing the entire file.
+- Size: Enable fast forward reading (skipping payloads).
 - SeqID: Global Sequence ID
 - Payload: The actual data.
-- Size (Footer): Enable fast reverse reading (Startup Optimization).
+- Size (Footer): Enable fast reverse reading for optimized startup recovery.
 
 ## Installation
 
@@ -107,17 +117,11 @@ if err := iter.Err(); err != nil {
 
 Contributions are welcome! Please fork the repository and open a pull request.
 
-1. Fork the Project.
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
 ## License
 
 MIT License. See [LICENSE](LICENSE) file.
 
-## Reference
+## References
 
-- [tidwall/wal](https://github.com/tidwall/wal)
 - [Log: What Every Software Engineer Should Know About Real-Time Data's Unifying Abstraction](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying)
+- [Designing Data-Intensive Applications](https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063)
