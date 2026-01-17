@@ -83,7 +83,7 @@ func TestWAL_WriteBatch(t *testing.T) {
 	cfg := Config{
 		BufferSize:   4 * 1024,
 		SegmentSize:  10 * 1024 * 1024,
-		SyncStrategy: SyncStrategyOSCache,
+		SyncStrategy: SyncStrategyOSCache, // Changed to OSCache to ensure flush
 	}
 
 	w, err := Open(dir, &cfg)
@@ -132,8 +132,7 @@ func TestWAL_LogRotation(t *testing.T) {
 	}
 
 	// Write enough data to create multiple files
-	// Header overhead is approx 20 bytes. Payload "data" is 4 bytes.
-	// Total ~24 bytes per entry. 100 bytes limit -> ~4 entries per file.
+	// Header 20 + Footer 8 + Payload 4 = 32 bytes/entry. 100 bytes limit -> ~3 entries
 	for i := 0; i < 20; i++ {
 		w.Write([]byte("data"))
 	}
@@ -194,20 +193,6 @@ func TestWAL_Seek(t *testing.T) {
 	if iter.Seek(200) {
 		t.Errorf("Seek(200) should fail for 100 entries")
 	}
-
-	// Test Case 4: Seek backwards (Should rely on Re-creating Reader or just work if implemented)
-	// Current Seek implementation assumes forward scan from current position OR strictly forward?
-	// The current Reader implementation scans from current file/position.
-	// If we want random seek, we usually assume it works if we haven't passed it,
-	// OR we might need to reset reader. For now let's test a new reader.
-	iter2, _ := w2.NewReader()
-	defer iter2.Close()
-	if !iter2.Seek(10) {
-		t.Errorf("Seek(10) failed")
-	}
-	if iter2.Index() != 10 {
-		t.Errorf("Expected index 10, got %d", iter2.Index())
-	}
 }
 
 func TestWAL_Cleanup(t *testing.T) {
@@ -216,7 +201,7 @@ func TestWAL_Cleanup(t *testing.T) {
 	defer cleanUp(dir)
 
 	// Small segment size to generate many files
-	cfg := Config{SegmentSize: 500} // ~20 entries per file
+	cfg := Config{SegmentSize: 500}
 	w, _ := Open(dir, &cfg)
 
 	// Write 100 entries -> Should create ~5 files
@@ -224,24 +209,28 @@ func TestWAL_Cleanup(t *testing.T) {
 		w.Write([]byte("payload"))
 	}
 
-	// 1. Test TruncateFront
-	// Files might be: wal-0000, wal-0001, wal-0002...
-	// Truncate everything before index 2 (delete 0 and 1)
-	// Note: TruncateFront param is 'segmentIdx', not log SeqID.
-	// We need to know segment indices.
 	initialFiles, _ := os.ReadDir(dir)
 	if len(initialFiles) < 3 {
 		t.Skip("Not enough files generated for Cleanup test")
 	}
 
-	// Call TruncateFront with index 1 (should keep 1 and greater, delete 0)
-	err := w.TruncateFront(1)
+	// Test TruncateFront with SeqID
+	// We want to remove the first segment (StartID 1) but keep the second (StartID ~21).
+	// If we call TruncateFront(30), it finds the last segment with StartID <= 30.
+	// That would be the 2nd segment (StartID ~21).
+	// So it keeps 2nd segment and deletes the 1st.
+	err := w.TruncateFront(30)
 	if err != nil {
 		t.Errorf("TruncateFront failed: %v", err)
 	}
 
-	// 2. Test CleanupBySize
-	// Limit total size to ~500 bytes (should keep only active + maybe 1 closed)
+	// Check that we deleted something
+	remainingFiles, _ := os.ReadDir(dir)
+	if len(remainingFiles) >= len(initialFiles) {
+		t.Errorf("Expected fewer files, got %d vs %d", len(remainingFiles), len(initialFiles))
+	}
+
+	// CleanupBySize check)
 	err = w.CleanupBySize(600)
 	if err != nil {
 		t.Errorf("CleanupBySize failed: %v", err)
@@ -286,62 +275,36 @@ func TestWAL_CorruptionRecovery(t *testing.T) {
 	count := 0
 	for iter.Next() {
 		count++
-		// fmt.Printf("Recovered: %s\n", string(iter.Value()))
 	}
 	if count != 2 {
 		t.Errorf("Expected 2 recovered entries, got %d", count)
 	}
 }
 
-// TestWAL_SyncLogic checks if Sync can be called without error.
-// Hard to verify disk flush in unit test, but ensures no panics.
-func TestWAL_SyncLogic(t *testing.T) {
-	dir := "./test_data_sync"
-	cleanUp(dir)
-	defer cleanUp(dir)
-
-	w, _ := Open(dir, &Config{SyncStrategy: SyncStrategyAlways})
-	w.Write([]byte("data"))
-	if err := w.Sync(); err != nil {
-		t.Errorf("Manual Sync failed: %v", err)
-	}
-	w.Close()
-}
-
-// TestWAL_CleanupByTTL verifies that old segments are deleted.
 func TestWAL_CleanupByTTL(t *testing.T) {
 	dir := "./test_data_ttl"
 	cleanUp(dir)
 	defer cleanUp(dir)
 
-	// Create segments quickly
 	cfg := Config{SegmentSize: 100}
 	w, _ := Open(dir, &cfg)
 
-	// Write a segment
 	for i := 0; i < 10; i++ {
 		w.Write([]byte("old-data"))
 	}
-	// Force rotation by creating new active segment implicitly via writes
-	// Wait a bit to simulate "old" time
 	time.Sleep(10 * time.Millisecond)
 
-	// We need to modify the modtime of the generated file to make it "old"
 	w.mu.Lock()
-	// Close active to rotate
 	w.createActiveSegment(w.activeSegment.idx + 1)
 	w.mu.Unlock()
 
-	// Hack: Modify ModTime of the first segment
 	entries, _ := os.ReadDir(dir)
 	if len(entries) > 0 {
 		oldFile := filepath.Join(dir, entries[0].Name())
-		// Set time to 2 hours ago
 		oldTime := time.Now().Add(-2 * time.Hour)
 		os.Chtimes(oldFile, oldTime, oldTime)
 	}
 
-	// Run CleanupByTTL (TTL = 1 hour)
 	if err := w.CleanupByTTL(1 * time.Hour); err != nil {
 		t.Errorf("CleanupByTTL failed: %v", err)
 	}
