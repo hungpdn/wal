@@ -47,19 +47,19 @@ var DefaultConfig = Config{
 
 // SetDefault sets default values for any zero-value fields in the Config.
 func (cfg *Config) SetDefault() {
-	if cfg.WALDir != "" {
+	if cfg.WALDir == "" {
 		cfg.WALDir = DefaultConfig.WALDir
 	}
-	if cfg.BufferSize != 0 {
+	if cfg.BufferSize == 0 {
 		cfg.BufferSize = DefaultConfig.BufferSize
 	}
-	if cfg.SegmentSize != 0 {
+	if cfg.SegmentSize < MB {
 		cfg.SegmentSize = DefaultConfig.SegmentSize
 	}
-	if cfg.SegmentPrefix != "" {
+	if cfg.SegmentPrefix == "" {
 		cfg.SegmentPrefix = DefaultConfig.SegmentPrefix
 	}
-	if cfg.SyncInterval != 0 {
+	if cfg.SyncInterval == 0 {
 		cfg.SyncInterval = DefaultConfig.SyncInterval
 	}
 }
