@@ -116,18 +116,6 @@ Contributions are welcome! Please fork the repository and open a pull request.
 
 MIT License. See [LICENSE](LICENSE) file.
 
-## TODO
-
-- [ ] Log level, metrics
-- [x] Tests
-- [ ] Retention policy (remove, upload to s3, gcs, etc)
-- [ ] Index
-- [x] CI
-- [ ] Benchmarks
-- [ ] Documentation
-- [x] Open source template (makefile, license, code of conduct, contributing, etc)
-- [ ] Distributed Replication
-
 ## Reference
 
 - [tidwall/wal](https://github.com/tidwall/wal)
