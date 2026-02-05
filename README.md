@@ -1,6 +1,6 @@
 # WAL: High-Performance Write-Ahead Log in Go
 
-![Go Version](https://img.shields.io/badge/go-1.25-blue)
+![Go Version](https://img.shields.io/badge/go-1.22-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hungpdn/wal)](https://goreportcard.com/report/github.com/hungpdn/wal)
 
@@ -53,13 +53,12 @@ import (
 )
 
 func main() {
- cfg := wal.Config{
-    WALDir:       "./wal_data",
+ opts := wal.Options{
     SegmentSize:  10 * 1024 * 1024, // 10MB
     SyncStrategy: wal.SyncStrategyOSCache,
  }
 
- w, _ := wal.New(cfg)
+ w, _ := wal.Open("./wal_data", &opts)
  defer w.Close()
 
  // Write data
@@ -71,7 +70,7 @@ func main() {
 ### Reading Data (Replay)
 
 ```go
-w, _ := wal.New(cfg) // Auto-recovers on open
+w, _ := wal.Open("", &opts) // Auto-recovers on open
 
 iter, _ := w.NewReader()
 defer iter.Close()
@@ -86,11 +85,10 @@ if err := iter.Err(); err != nil {
 }
 ```
 
-### Configuration
+### Options
 
 |Field       |Type  |Default   |Description                                         |
 |------------|------|----------|----------------------------------------------------|
-|WALDir      |string|./wal     |Directory to store segment files.                   |
 |SegmentSize |int64 |10MB      |Max size of a single segment file before rotation.  |
 |BufferSize  |int   |4KB       |Size of the in-memory buffer.                       |
 |SyncStrategy|int   |Background|0: Background, 1: Always (Fsync), 2: OSCache (Recm).|
@@ -122,7 +120,7 @@ MIT License. See [LICENSE](LICENSE) file.
 - [x] Tests
 - [ ] Retention policy (remove, upload to s3, gcs, etc)
 - [ ] Index
-- [ ] CI
+- [x] CI
 - [ ] Benchmarks
 - [ ] Documentation
 - [x] Open source template (makefile, license, code of conduct, contributing, etc)

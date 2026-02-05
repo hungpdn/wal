@@ -5,6 +5,9 @@ import "hash/crc32"
 const (
 	KB = 1024    // 1 Kilobyte
 	MB = KB * KB // 1 Megabyte
+
+	PermMkdir    = 0755
+	PermFileOpen = 0600
 )
 
 // SyncStrategy defines the synchronization strategy for WAL.
@@ -25,9 +28,8 @@ const (
 	SyncStrategyOSCache SyncStrategy = 2
 )
 
-// Config holds the configuration for WAL.
-type Config struct {
-	WALDir        string       // Directory to store WAL files
+// Options holds the configuration for WAL.
+type Options struct {
 	BufferSize    int          // Buffered writes size in bytes (e.g., 4KB)
 	SegmentSize   int64        // Maximum size of each file (e.g., 10MB)
 	SegmentPrefix string       // Prefix for segment file names (e.g., "segment")
@@ -35,9 +37,8 @@ type Config struct {
 	SyncInterval  uint         // Sync interval in milliseconds for background sync
 }
 
-// DefaultConfig provides default configuration values for WAL.
-var DefaultConfig = Config{
-	WALDir:        "./wal",
+// DefaultOptions provides default configuration values for WAL.
+var DefaultOptions = Options{
 	BufferSize:    4 * KB,  // 4KB
 	SegmentSize:   10 * MB, // 10MB
 	SegmentPrefix: "segment",
@@ -45,22 +46,19 @@ var DefaultConfig = Config{
 	SyncInterval:  1000, // 1000ms = 1s
 }
 
-// SetDefault sets default values for any zero-value fields in the Config.
-func (cfg *Config) SetDefault() {
-	if cfg.WALDir == "" {
-		cfg.WALDir = DefaultConfig.WALDir
-	}
+// SetDefault sets default values for any zero-value fields in the Options.
+func (cfg *Options) SetDefault() {
 	if cfg.BufferSize == 0 {
-		cfg.BufferSize = DefaultConfig.BufferSize
+		cfg.BufferSize = DefaultOptions.BufferSize
 	}
 	if cfg.SegmentSize < MB {
-		cfg.SegmentSize = DefaultConfig.SegmentSize
+		cfg.SegmentSize = DefaultOptions.SegmentSize
 	}
 	if cfg.SegmentPrefix == "" {
-		cfg.SegmentPrefix = DefaultConfig.SegmentPrefix
+		cfg.SegmentPrefix = DefaultOptions.SegmentPrefix
 	}
 	if cfg.SyncInterval == 0 {
-		cfg.SyncInterval = DefaultConfig.SyncInterval
+		cfg.SyncInterval = DefaultOptions.SyncInterval
 	}
 }
 

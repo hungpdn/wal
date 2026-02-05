@@ -3,96 +3,120 @@ package main
 import (
 	"fmt"
 	"log"
-	"time"
+	"os"
 
 	"github.com/hungpdn/wal"
 )
 
 func main() {
 	walDir := "./wal_data"
+	_ = os.RemoveAll(walDir)
 
-	// ==========================================
-	// SCENARIO 1: NORMAL DATA RECORDING
-	// ==========================================
-	fmt.Println("🚀 [Phase 1] Initialize WAL & Write data...")
+	fmt.Println("🚀 WAL Library - Full Feature Demo")
+	fmt.Println("==================================")
 
-	// 1. Config
-	cfg := wal.Config{
-		WALDir:       walDir,
-		BufferSize:   4 * 1024,                // 4KB Buffer
-		SegmentSize:  100 * 1024,              // 100KB per file (to test file rotation speed)
-		SyncStrategy: wal.SyncStrategyOSCache, // Strategy 2 (Recommended)
-		SyncInterval: 1000,                    // Sync every 1s
+	// 1. Configuration
+	// We use a very small SegmentSize (10KB) to demonstrate Log Rotation and Cleanup easily.
+	cfg := wal.Options{
+		BufferSize:    4 * 1024,                // 4KB Buffer
+		SegmentSize:   10 * 1024,               // 10KB (Small for demo purposes)
+		SegmentPrefix: "wal",                   // Prefix: wal-0000.wal
+		SyncStrategy:  wal.SyncStrategyOSCache, // Performance + Safety balanced
+		SyncInterval:  500,                     // Sync every 500ms
 	}
 
-	// 2. Initialize
-	w, err := wal.New(cfg)
+	// ==========================================
+	// PART 1: WRITING (Basic & Batch)
+	// ==========================================
+	fmt.Println("\n📝 [Part 1] Writing Data...")
+
+	w, err := wal.Open(walDir, &cfg)
 	if err != nil {
 		log.Fatalf("❌ Init failed: %v", err)
 	}
 
-	// 3. Write 5000 log
-	start := time.Now()
-	for i := 0; i < 5000; i++ {
-		payload := fmt.Sprintf("Log-Entry-%d: User A transferred $100 to B", i)
-		if err := w.Write([]byte(payload)); err != nil {
-			log.Fatalf("❌ Write error: %v", err)
-		}
-		// Simulate small delay to allow background sync to run
-		if i%1000 == 0 {
-			time.Sleep(10 * time.Millisecond)
+	// A. Basic Write
+	fmt.Println("   -> Writing 500 individual entries...")
+	for i := 0; i < 500; i++ {
+		payload := []byte(fmt.Sprintf("Entry-%d", i))
+		if err := w.Write(payload); err != nil {
+			log.Fatalf("Write error: %v", err)
 		}
 	}
-	fmt.Printf("✅ Write finished 5000 log in %v\n", time.Since(start))
 
-	// 4. Close securely
-	if err := w.Close(); err != nil {
-		log.Fatalf("❌ Close error: %v", err)
+	// B. Batch Write (Higher Throughput)
+	fmt.Println("   -> Writing 500 entries using WriteBatch...")
+	var batch [][]byte
+	for i := 500; i < 1000; i++ {
+		batch = append(batch, []byte(fmt.Sprintf("BatchEntry-%d", i)))
 	}
-	fmt.Println("🔒 WAL has been closed. Data is now safe on disk.")
+	// Writes all 500 entries acquiring the lock only once
+	if err := w.WriteBatch(batch); err != nil {
+		log.Fatalf("Batch write error: %v", err)
+	}
+
+	// Get current segment index to see rotation
+	lastIdx := w.GetLastSegmentIdx()
+	fmt.Printf("   ✅ Write complete. Current Active Segment Index: %d\n", lastIdx)
+
+	w.Close()
 
 	// ==========================================
-	// SCENARIO 2: RECOVERY & REPLAY
+	// PART 2: READING (Iterator)
 	// ==========================================
-	fmt.Println("\n🔄 [Phase 2] Restart & Replay Simulation...")
+	fmt.Println("\n📖 [Part 2] Reading Data (Replay)...")
 
-	// 1. Reopen WAL (Automatic Recovery if errors occur)
-	w2, err := wal.New(cfg)
+	wRead, err := wal.Open(walDir, &cfg)
 	if err != nil {
-		log.Fatalf("❌ Recovery failed: %v", err)
+		log.Fatalf("Open failed: %v", err)
 	}
-	defer w2.Close()
+	defer wRead.Close()
 
-	// 2. Create Iterator to read
-	iter, err := w2.NewReader()
+	iter, err := wRead.NewReader()
 	if err != nil {
-		log.Fatalf("❌ Iterator failed: %v", err)
+		log.Fatalf("Reader failed: %v", err)
 	}
 	defer iter.Close()
 
-	// 3. Browse logs
 	count := 0
-	fmt.Println("   --- Start reading ---")
 	for iter.Next() {
-		data := iter.Value()
-		// Print the first 3 lines and the last 3 lines as a test.
-		if count < 3 || count >= 4997 {
-			fmt.Printf("   [%4d] %s\n", count, string(data))
-		}
-		if count == 3 {
-			fmt.Println("   ... (reading) ...")
-		}
+		// val := iter.Value()
+		// fmt.Println(string(val)) // Uncomment to see data
 		count++
 	}
 
-	// 4. Check for errors
 	if err := iter.Err(); err != nil {
-		log.Printf("⚠️ Replay stopped due to error.: %v", err)
-	} else {
-		fmt.Printf("✅ Replay successful: Read %d/5000 records.\n", count)
+		log.Printf("⚠️ Iterator stopped with error: %v", err)
+	}
+	fmt.Printf("   ✅ Read %d total records from disk.\n", count)
+
+	// ==========================================
+	// PART 3: RETENTION & CLEANUP
+	// ==========================================
+	fmt.Println("\n🧹 [Part 3] Retention & Cleanup...")
+
+	// To demonstrate cleanup, we need multiple segments.
+	// Since we wrote ~1000 entries with small SegmentSize, we should have multiple files.
+
+	// A. Cleanup By Size (Keep max 50KB)
+	fmt.Println("   -> Running CleanupBySize (Max 50KB)...")
+	// Note: 50KB is roughly 5 segments (since we set SegmentSize=10KB)
+	if err := wRead.CleanupBySize(50 * 1024); err != nil {
+		log.Printf("CleanupBySize warning: %v", err)
 	}
 
-	if count == 5000 {
-		fmt.Println("🎉 DATA INTEGRITY 100%!")
+	// B. Manual Truncate (Remove everything before Segment 2)
+	fmt.Println("   -> Running TruncateFront(2)...")
+	if err := wRead.TruncateFront(2); err != nil {
+		log.Printf("TruncateFront warning: %v", err)
 	}
+
+	// Check remaining files
+	entries, _ := os.ReadDir(walDir)
+	fmt.Printf("   ✅ Cleanup finished. Remaining segment files: %d\n", len(entries))
+	for _, e := range entries {
+		fmt.Printf("      - %s\n", e.Name())
+	}
+
+	fmt.Println("\n🎉 Demo Completed Successfully!")
 }
