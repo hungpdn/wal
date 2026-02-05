@@ -20,13 +20,14 @@ WAL (Write-Ahead Log) Format:
 Each segment file consists of a sequence of binary encoded entries.
 
 +-------------------+-------------------+-------------------+----------------------+
-|   CRC32 (4 bytes) |   Size (8 bytes)  |  Offset (8 bytes) |   Payload (N bytes)  |
+|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |
 +-------------------+-------------------+-------------------+----------------------+
-| Checksum of Data  | Length of Payload | Logical Position  | The actual data      |
+| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      |
 +-------------------+-------------------+-------------------+----------------------+
 
 - CRC (Cyclic Redundancy Check): Ensures data integrity.
-- Size & Offset: Enable fast reading without parsing the entire file.
+- Size: Enable fast reading without parsing the entire file.
+- SeqID: Global Sequence ID
 - Payload: The actual data.
 */
 
@@ -34,20 +35,13 @@ const (
 	// Size of various components in the WAL entry header
 	crcSize    = 4
 	sizeSize   = 8
-	offsetSize = 8
-	headerSize = crcSize + sizeSize + offsetSize
+	seqIDSize  = 8
+	headerSize = crcSize + sizeSize + seqIDSize
 )
 
 var (
 	ErrInvalidCRC = errors.New("wal: invalid crc, data corruption detected")
 )
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		// Allocate a default buffer. It will grow if needed.
-		return make([]byte, 4096+headerSize)
-	},
-}
 
 // WAL: Write-Ahead Log structure
 type WAL struct {
@@ -61,6 +55,8 @@ type WAL struct {
 	syncStrategy  SyncStrategy   // Sync strategy
 	stopSync      chan struct{}  // Channel to stop background sync
 	wg            sync.WaitGroup // WaitGroup for background sync
+	lastSeqID     uint64         // Track the global sequence ID
+	bufPool       sync.Pool
 }
 
 // Segment: Represents a physical file
@@ -78,7 +74,7 @@ type segmentFile struct {
 }
 
 // Open: Initialize and recover data
-func Open(dir string, opts *Options) (*WAL, error) {
+func Open(dir string, cfg *Config) (*WAL, error) {
 
 	// Ensure WAL directory exists
 	if err := os.MkdirAll(dir, PermMkdir); err != nil {
@@ -86,19 +82,24 @@ func Open(dir string, opts *Options) (*WAL, error) {
 	}
 
 	// Load default config values if not set
-	if opts == nil {
-		opts = &DefaultOptions
+	if cfg == nil {
+		cfg = &DefaultConfig
 	}
-	opts.SetDefault()
+	cfg.SetDefault()
 
 	// Initialize WAL structure
 	wal := WAL{
 		dir:           dir,
-		bufferSize:    opts.BufferSize,
-		segmentSize:   opts.SegmentSize,
-		segmentPrefix: opts.SegmentPrefix,
-		syncStrategy:  opts.SyncStrategy,
+		bufferSize:    cfg.BufferSize,
+		segmentSize:   cfg.SegmentSize,
+		segmentPrefix: cfg.SegmentPrefix,
+		syncStrategy:  cfg.SyncStrategy,
 		stopSync:      make(chan struct{}),
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 4*KB+headerSize)
+			},
+		},
 	}
 
 	// Load existing segments from disk for recovery
@@ -109,7 +110,7 @@ func Open(dir string, opts *Options) (*WAL, error) {
 	// Only run background sync if not SyncStrategyAlways
 	if wal.syncStrategy != SyncStrategyAlways {
 		wal.wg.Add(1)
-		go wal.backgroundSync(time.Duration(opts.SyncInterval) * time.Millisecond)
+		go wal.backgroundSync(time.Duration(cfg.SyncInterval) * time.Millisecond)
 	}
 
 	return &wal, nil
@@ -190,7 +191,50 @@ func (w *WAL) loadSegments() error {
 			w.segments = append(w.segments, seg)
 		}
 	}
+
+	// SPECIAL CASE: If active segment is empty (newly rotated before crash),
+	// we need to find lastSeqID from the previous closed segment.
+	if w.activeSegment.size == 0 && len(w.segments) > 0 {
+		lastClosedSeg := w.segments[len(w.segments)-1]
+		lastID, err := w.scanSegmentForLastID(lastClosedSeg.path)
+		if err != nil {
+			return fmt.Errorf("failed to recover SeqID from previous segment: %v", err)
+		}
+		w.lastSeqID = lastID
+	}
 	return nil
+}
+
+// scanSegmentForLastID reads a closed segment to find the highest SeqID.
+// This is only called once at startup if the active segment is empty.
+func (w *WAL) scanSegmentForLastID(path string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	var lastID uint64
+
+	for {
+		header := make([]byte, headerSize)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return 0, err
+		}
+		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
+		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+		lastID = seqID
+
+		// Skip payload
+		if _, err := reader.Discard(int(size)); err != nil {
+			return 0, err
+		}
+	}
+	return lastID, nil
 }
 
 // repairActiveSegment: Repair the active segment file if corrupted
@@ -199,7 +243,6 @@ func (w *WAL) loadSegments() error {
 func (w *WAL) repairActiveSegment() error {
 
 	f := w.activeSegment.file
-
 	// Read from the beginning
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -207,13 +250,14 @@ func (w *WAL) repairActiveSegment() error {
 
 	reader := bufio.NewReader(f)
 	var validOffset int64 = 0
+	var maxSeqID uint64 = 0
 
 	for {
 		// Read Header (CRC + Size + Offset)
 		header := make([]byte, headerSize)
 		if _, err := io.ReadFull(reader, header); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break // End of file or truncated file -> Stop
+				break
 			}
 			return err
 		}
@@ -221,27 +265,27 @@ func (w *WAL) repairActiveSegment() error {
 		// Parse Header
 		readCrc := binary.BigEndian.Uint32(header[:crcSize])
 		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
-		offset := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
 
 		// Read Payload
 		payload := make([]byte, size)
 		if _, err := io.ReadFull(reader, payload); err != nil {
-			break // Payload read error -> Stop
+			break
 		}
 
 		// Verify CRC
-		verifyBuf := make([]byte, sizeSize+offsetSize+len(payload))
+		verifyBuf := make([]byte, sizeSize+seqIDSize+len(payload))
 		binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
-		binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+offsetSize], offset)
-		copy(verifyBuf[sizeSize+offsetSize:], payload)
+		binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+seqIDSize], seqID)
+		copy(verifyBuf[sizeSize+seqIDSize:], payload)
 
 		if calculateCRC(verifyBuf) != readCrc {
 			log.Println("⚠️ WAL: Corrupted tail detected, truncating...")
 			break
 		}
 
-		// Valid record, update offset safely
 		validOffset += int64(headerSize + size)
+		maxSeqID = seqID
 	}
 
 	// Truncate file to the last valid position
@@ -255,6 +299,7 @@ func (w *WAL) repairActiveSegment() error {
 	}
 	w.activeSegment.size = validOffset
 	w.activeSegment.writer = bufio.NewWriterSize(f, w.bufferSize) // Reset buffer writer
+	w.lastSeqID = maxSeqID                                        // Update global state
 
 	return nil
 }
@@ -347,20 +392,24 @@ func (w *WAL) backgroundSync(interval time.Duration) {
 }
 
 func (w *WAL) bufferWrite(payload []byte) error {
+	w.lastSeqID++
+
 	pktSize := int64(headerSize + len(payload))
 	payloadLen := uint64(len(payload))
-	currentOffset := uint64(w.activeSegment.size)
+
+	currentSeqID := w.lastSeqID
 
 	var buf []byte
-	obj := bufPool.Get()
+	obj := w.bufPool.Get()
 	if b, ok := obj.([]byte); ok && int64(cap(b)) >= pktSize {
 		buf = b[:pktSize]
 	} else {
 		buf = make([]byte, pktSize)
 	}
 
+	// [CRC][Size][SeqID][Payload]
 	binary.BigEndian.PutUint64(buf[crcSize:crcSize+sizeSize], payloadLen)
-	binary.BigEndian.PutUint64(buf[crcSize+sizeSize:headerSize], currentOffset)
+	binary.BigEndian.PutUint64(buf[crcSize+sizeSize:headerSize], currentSeqID)
 	copy(buf[headerSize:], payload)
 
 	checksum := calculateCRC(buf[crcSize:])
@@ -370,7 +419,7 @@ func (w *WAL) bufferWrite(payload []byte) error {
 		return err
 	}
 
-	bufPool.Put(buf)
+	w.bufPool.Put(buf)
 	w.activeSegment.size += pktSize
 	return nil
 }

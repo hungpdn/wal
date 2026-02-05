@@ -10,10 +10,12 @@ import (
 
 // Reader: Interface to read logs sequentially
 type Reader interface {
-	Next() bool    // Move to the next log
-	Value() []byte // Get the data of the current log
-	Err() error    // Get error if any
-	Close() error  // Close the reader
+	Next() bool          // Move to the next log
+	Value() []byte       // Get the data of the current log
+	Index() uint64       // Get the Global Sequence ID
+	Seek(id uint64) bool // Fast Forward
+	Err() error          // Get error if any
+	Close() error        // Close the reader
 }
 
 // Iterator: Implementation of Reader
@@ -24,8 +26,11 @@ type Iterator struct {
 	currentFile   *os.File   // File descriptor currently open
 	currentReader *io.Reader // Reader wrapper (could be buffered)
 	currentEntry  []byte     // Current log entry data
+	currentSeqID  uint64     // Store current ID
 	err           error      // Error if any
 	closed        bool       // Whether the iterator is closed
+	// Optimization: Reusable buffer for CRC verification to reduce GC pressure
+	verifyBuf []byte
 }
 
 // NewReader: Create an Iterator starting from the oldest segment
@@ -101,7 +106,7 @@ func (it *Iterator) Next() bool {
 
 		readCrc := binary.BigEndian.Uint32(header[:crcSize])
 		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
-		offset := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
 
 		payload := make([]byte, size)
 		if _, err := io.ReadFull(*it.currentReader, payload); err != nil {
@@ -109,19 +114,31 @@ func (it *Iterator) Next() bool {
 			return false
 		}
 
-		verifyBuf := make([]byte, sizeSize+offsetSize+len(payload))
-		binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
-		binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+offsetSize], offset)
-		copy(verifyBuf[sizeSize+offsetSize:], payload)
+		neededSize := sizeSize + seqIDSize + len(payload)
+		if cap(it.verifyBuf) < neededSize {
+			it.verifyBuf = make([]byte, neededSize)
+		} else {
+			it.verifyBuf = it.verifyBuf[:neededSize]
+		}
 
-		if calculateCRC(verifyBuf) != readCrc {
+		binary.BigEndian.PutUint64(it.verifyBuf[:sizeSize], size)
+		binary.BigEndian.PutUint64(it.verifyBuf[sizeSize:sizeSize+seqIDSize], seqID)
+		copy(it.verifyBuf[sizeSize+seqIDSize:], payload)
+
+		if calculateCRC(it.verifyBuf) != readCrc {
 			it.err = fmt.Errorf("wal: corrupted data (crc mismatch) at segment %s", it.segmentPaths[it.currentIdx])
 			return false
 		}
 
 		it.currentEntry = payload
+		it.currentSeqID = seqID
 		return true
 	}
+}
+
+// Index returns the Global Sequence ID of the current log entry
+func (it *Iterator) Index() uint64 {
+	return it.currentSeqID
 }
 
 // Value: Get the data of the current log entry
@@ -144,4 +161,73 @@ func (it *Iterator) Close() error {
 		return it.currentFile.Close()
 	}
 	return nil
+}
+
+// Seek: Fast-forward to the record with ID >= startID
+// It will skip reading the payload and verifying the CRC of older records
+func (it *Iterator) Seek(startID uint64) bool {
+	for {
+
+		if it.currentFile == nil {
+			if it.currentIdx >= len(it.segmentPaths) {
+				return false
+			}
+			path := it.segmentPaths[it.currentIdx]
+			f, err := os.Open(path)
+			if err != nil {
+				it.err = err
+				return false
+			}
+			it.currentFile = f
+			br := bufio.NewReader(f)
+			reader := io.Reader(br)
+			it.currentReader = &reader
+		}
+
+		header := make([]byte, headerSize)
+		if _, err := io.ReadFull(*it.currentReader, header); err != nil {
+			if err == io.EOF {
+				it.currentFile.Close()
+				it.currentFile = nil
+				it.currentIdx++
+				continue
+			}
+			it.err = err
+			return false
+		}
+
+		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
+		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+
+		if seqID < startID {
+			// Use Discard to jump over byte 'size' without copying the data
+			if _, err := io.CopyN(io.Discard, *it.currentReader, int64(size)); err != nil {
+				it.err = err
+				return false
+			}
+			continue
+		} else {
+
+			payload := make([]byte, size)
+			if _, err := io.ReadFull(*it.currentReader, payload); err != nil {
+				it.err = err
+				return false
+			}
+
+			verifyBuf := make([]byte, sizeSize+seqIDSize+len(payload))
+			binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
+			binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+seqIDSize], seqID)
+			copy(verifyBuf[sizeSize+seqIDSize:], payload)
+
+			readCrc := binary.BigEndian.Uint32(header[:crcSize])
+			if calculateCRC(verifyBuf) != readCrc {
+				it.err = fmt.Errorf("wal: corrupted data at seek target in segment %s", it.segmentPaths[it.currentIdx])
+				return false
+			}
+
+			it.currentEntry = payload
+			it.currentSeqID = seqID
+			return true
+		}
+	}
 }

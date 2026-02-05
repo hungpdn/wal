@@ -17,7 +17,7 @@ func main() {
 
 	// 1. Configuration
 	// We use a very small SegmentSize (10KB) to demonstrate Log Rotation and Cleanup easily.
-	cfg := wal.Options{
+	cfg := wal.Config{
 		BufferSize:    4 * 1024,                // 4KB Buffer
 		SegmentSize:   10 * 1024,               // 10KB (Small for demo purposes)
 		SegmentPrefix: "wal",                   // Prefix: wal-0000.wal
@@ -62,7 +62,7 @@ func main() {
 	w.Close()
 
 	// ==========================================
-	// PART 2: READING (Iterator)
+	// PART 2: READING (Iterator / Checkpoint / Resume)
 	// ==========================================
 	fmt.Println("\n📖 [Part 2] Reading Data (Replay)...")
 
@@ -79,9 +79,19 @@ func main() {
 	defer iter.Close()
 
 	count := 0
+	lastIndex := uint64(0)
 	for iter.Next() {
-		// val := iter.Value()
-		// fmt.Println(string(val)) // Uncomment to see data
+
+		if count < 5 || count > 995 {
+			fmt.Printf("ID: %d | Data: %s\n", iter.Index(), string(iter.Value()))
+		}
+
+		if iter.Index() != lastIndex+1 {
+			panic("Missing gap!")
+		}
+
+		lastIndex = iter.Index()
+
 		count++
 	}
 
@@ -89,6 +99,34 @@ func main() {
 		log.Printf("⚠️ Iterator stopped with error: %v", err)
 	}
 	fmt.Printf("   ✅ Read %d total records from disk.\n", count)
+
+	fmt.Println("\n📖 [Part 2.1] Resuming from Checkpoint...")
+
+	// Let's assume the app crashed at ID = 900 last time
+	checkpointID := uint64(500)
+	fmt.Printf("   -> Seeking to ID: %d ...\n", checkpointID)
+
+	iter, err = wRead.NewReader()
+	if err != nil {
+		log.Fatalf("Reader failed: %v", err)
+	}
+	defer iter.Close()
+
+	if found := iter.Seek(checkpointID); !found {
+		if iter.Err() != nil {
+			log.Fatalf("Seek failed: %v", iter.Err())
+		}
+		fmt.Println("   -> ID not found (end of log).")
+	} else {
+		fmt.Printf("   ✅ Resumed! Found ID: %d | Data: %s\n", iter.Index(), string(iter.Value()))
+
+		for iter.Next() {
+			// Process logic...
+			if iter.Index() < 503 && iter.Index() > 500 {
+				fmt.Printf("ID: %d | Data: %s\n", iter.Index(), string(iter.Value()))
+			}
+		}
+	}
 
 	// ==========================================
 	// PART 3: RETENTION & CLEANUP
