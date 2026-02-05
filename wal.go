@@ -19,16 +19,17 @@ import (
 WAL (Write-Ahead Log) Format:
 Each segment file consists of a sequence of binary encoded entries.
 
-+-------------------+-------------------+-------------------+----------------------+
-|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |
-+-------------------+-------------------+-------------------+----------------------+
-| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      |
-+-------------------+-------------------+-------------------+----------------------+
++-------------------+-------------------+-------------------+----------------------+-------------------+
+|   CRC32 (4 bytes) |   Size (8 bytes)  |   SeqID (8 bytes) |   Payload (N bytes)  |   Size (8 bytes)  |
++-------------------+-------------------+-------------------+----------------------+-------------------+
+| Checksum of Data  | Length of Payload | Monotonic ID      | The actual data      | Backward Pointer  |
++-------------------+-------------------+-------------------+----------------------+-------------------+
 
 - CRC (Cyclic Redundancy Check): Ensures data integrity.
-- Size: Enable fast reading without parsing the entire file.
+- Size (Header): Enable fast forward reading.
 - SeqID: Global Sequence ID
 - Payload: The actual data.
+- Size (Footer): Enable fast reverse reading (Startup Optimization).
 */
 
 const (
@@ -37,6 +38,7 @@ const (
 	sizeSize   = 8
 	seqIDSize  = 8
 	headerSize = crcSize + sizeSize + seqIDSize
+	footerSize = sizeSize // New Footer
 )
 
 var (
@@ -97,7 +99,8 @@ func Open(dir string, cfg *Config) (*WAL, error) {
 		stopSync:      make(chan struct{}),
 		bufPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 4*KB+headerSize)
+				// Allocate buffer for Header + Payload + Footer
+				return make([]byte, 4*KB+headerSize+footerSize)
 			},
 		},
 	}
@@ -214,6 +217,35 @@ func (w *WAL) scanSegmentForLastID(path string) (uint64, error) {
 	}
 	defer f.Close()
 
+	// Optimized: Try reverse scan first
+	stat, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	fileSize := stat.Size()
+	if fileSize >= int64(headerSize+footerSize) {
+		// Read last 8 bytes (Footer)
+		footer := make([]byte, footerSize)
+		if _, err := f.ReadAt(footer, fileSize-int64(footerSize)); err == nil {
+			lastPayloadSize := binary.BigEndian.Uint64(footer)
+			// Calculate the start of the last record
+			recordSize := int64(headerSize) + int64(lastPayloadSize) + int64(footerSize)
+			if fileSize >= recordSize {
+				// Read Header
+				header := make([]byte, headerSize)
+				if _, err := f.ReadAt(header, fileSize-recordSize); err == nil {
+					seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
+					// Ideally we should verify CRC here too, but for simplicity we assume closed segments are valid
+					return seqID, nil
+				}
+			}
+		}
+	}
+
+	// Fallback to sequential scan
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
 	reader := bufio.NewReader(f)
 	var lastID uint64
 
@@ -229,21 +261,76 @@ func (w *WAL) scanSegmentForLastID(path string) (uint64, error) {
 		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
 		lastID = seqID
 
-		// Skip payload
-		if _, err := reader.Discard(int(size)); err != nil {
+		// Skip payload AND footer
+		if _, err := reader.Discard(int(size) + footerSize); err != nil {
 			return 0, err
 		}
 	}
 	return lastID, nil
 }
 
-// repairActiveSegment: Repair the active segment file if corrupted
-// Simple logic: Read through the active file to find the last valid point
-// In real production, we would do tail reading to optimize. Here we use scanning for clarity.
+// repairActiveSegment: Repair the active segment file if corrupted using Reverse Scan.
 func (w *WAL) repairActiveSegment() error {
-
 	f := w.activeSegment.file
-	// Read from the beginning
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := stat.Size()
+
+	// Empty file is valid
+	if fileSize == 0 {
+		w.activeSegment.size = 0
+		w.lastSeqID = 0 // Will be fixed by loadSegments if previous segments exist
+		return nil
+	}
+
+	// 1. Attempt Reverse Recovery (Optimization)
+	if fileSize >= int64(headerSize+footerSize) {
+		// Read Footer (Last 8 bytes)
+		footer := make([]byte, footerSize)
+		if _, err := f.ReadAt(footer, fileSize-int64(footerSize)); err == nil {
+			payloadSize := binary.BigEndian.Uint64(footer)
+			totalRecordSize := int64(headerSize) + int64(payloadSize) + int64(footerSize)
+
+			if fileSize >= totalRecordSize {
+				// Jump back to the start of this record
+				offset := fileSize - totalRecordSize
+
+				// Read Header + Payload
+				data := make([]byte, headerSize+int64(payloadSize))
+				if _, err := f.ReadAt(data, offset); err == nil {
+
+					// Parse Header
+					readCrc := binary.BigEndian.Uint32(data[:crcSize])
+					size := binary.BigEndian.Uint64(data[crcSize : crcSize+sizeSize])
+					seqID := binary.BigEndian.Uint64(data[crcSize+sizeSize : headerSize])
+
+					if size == payloadSize {
+						// Verify CRC
+						verifyBuf := make([]byte, sizeSize+seqIDSize+int(payloadSize))
+						binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
+						binary.BigEndian.PutUint64(verifyBuf[sizeSize:sizeSize+seqIDSize], seqID)
+						copy(verifyBuf[sizeSize+seqIDSize:], data[headerSize:])
+
+						if calculateCRC(verifyBuf) == readCrc {
+							// SUCCESS: The last record is valid.
+							// No truncation needed.
+							w.activeSegment.size = fileSize
+							w.activeSegment.writer = bufio.NewWriterSize(f, w.bufferSize)
+							w.lastSeqID = seqID
+							log.Printf("WAL: Startup optimized. Verified last record at offset %d (SeqID: %d)", offset, seqID)
+							return nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Fallback: If reverse check fails (corrupted tail or file too small), do full scan
+	log.Println("WAL: Fast startup failed or corruption detected. Falling back to sequential repair...")
+
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
@@ -253,7 +340,7 @@ func (w *WAL) repairActiveSegment() error {
 	var maxSeqID uint64 = 0
 
 	for {
-		// Read Header (CRC + Size + Offset)
+		// Read Header
 		header := make([]byte, headerSize)
 		if _, err := io.ReadFull(reader, header); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -262,7 +349,6 @@ func (w *WAL) repairActiveSegment() error {
 			return err
 		}
 
-		// Parse Header
 		readCrc := binary.BigEndian.Uint32(header[:crcSize])
 		size := binary.BigEndian.Uint64(header[crcSize : crcSize+sizeSize])
 		seqID := binary.BigEndian.Uint64(header[crcSize+sizeSize : headerSize])
@@ -273,6 +359,19 @@ func (w *WAL) repairActiveSegment() error {
 			break
 		}
 
+		// Read Footer
+		footer := make([]byte, footerSize)
+		if _, err := io.ReadFull(reader, footer); err != nil {
+			break
+		}
+		footerSizeVal := binary.BigEndian.Uint64(footer)
+
+		// Basic integrity check: Footer size must match Header size
+		if footerSizeVal != size {
+			log.Println("⚠️ WAL: Corrupted record (Size mismatch between Header and Footer)")
+			break
+		}
+
 		// Verify CRC
 		verifyBuf := make([]byte, sizeSize+seqIDSize+len(payload))
 		binary.BigEndian.PutUint64(verifyBuf[:sizeSize], size)
@@ -280,11 +379,11 @@ func (w *WAL) repairActiveSegment() error {
 		copy(verifyBuf[sizeSize+seqIDSize:], payload)
 
 		if calculateCRC(verifyBuf) != readCrc {
-			log.Println("⚠️ WAL: Corrupted tail detected, truncating...")
+			log.Println("⚠️ WAL: Corrupted tail detected (CRC mismatch), truncating...")
 			break
 		}
 
-		validOffset += int64(headerSize + size)
+		validOffset += int64(headerSize + size + footerSize)
 		maxSeqID = seqID
 	}
 
@@ -298,8 +397,8 @@ func (w *WAL) repairActiveSegment() error {
 		return err
 	}
 	w.activeSegment.size = validOffset
-	w.activeSegment.writer = bufio.NewWriterSize(f, w.bufferSize) // Reset buffer writer
-	w.lastSeqID = maxSeqID                                        // Update global state
+	w.activeSegment.writer = bufio.NewWriterSize(f, w.bufferSize)
+	w.lastSeqID = maxSeqID
 
 	return nil
 }
@@ -331,10 +430,8 @@ func (w *WAL) createActiveSegment(idx uint64) error {
 	}
 
 	// Sync parent directory
-	// The file has been synced, but its entry in the parent directory may not have been synced to disk
-	// If the power goes out at the moment the new file is created, that file may disappear completely
 	if dir, err := os.Open(w.dir); err == nil {
-		dir.Sync() // Ensure that the entry for the new file is written to the directory table
+		dir.Sync()
 		dir.Close()
 	}
 
@@ -366,13 +463,11 @@ func (w *WAL) backgroundSync(interval time.Duration) {
 				}
 
 			case SyncStrategyOSCache:
-				// Minimized Lock Contention
 				w.mu.Lock()
 				if w.activeSegment == nil || w.activeSegment.file == nil {
 					w.mu.Unlock()
 					continue
 				}
-				// Copy file pointer to local variable
 				f := w.activeSegment.file
 				w.mu.Unlock()
 
@@ -394,7 +489,8 @@ func (w *WAL) backgroundSync(interval time.Duration) {
 func (w *WAL) bufferWrite(payload []byte) error {
 	w.lastSeqID++
 
-	pktSize := int64(headerSize + len(payload))
+	// Header + Payload + Footer
+	pktSize := int64(headerSize + len(payload) + footerSize)
 	payloadLen := uint64(len(payload))
 
 	currentSeqID := w.lastSeqID
@@ -407,12 +503,23 @@ func (w *WAL) bufferWrite(payload []byte) error {
 		buf = make([]byte, pktSize)
 	}
 
-	// [CRC][Size][SeqID][Payload]
+	// 1. Write Header: [CRC][Size][SeqID]
 	binary.BigEndian.PutUint64(buf[crcSize:crcSize+sizeSize], payloadLen)
 	binary.BigEndian.PutUint64(buf[crcSize+sizeSize:headerSize], currentSeqID)
+
+	// 2. Write Payload
 	copy(buf[headerSize:], payload)
 
-	checksum := calculateCRC(buf[crcSize:])
+	// 3. Write Footer: [Size]
+	// Position = headerSize + len(payload)
+	binary.BigEndian.PutUint64(buf[headerSize+len(payload):], payloadLen)
+
+	// Calculate CRC (Header + Payload only, excluding Footer usually, but let's exclude footer from CRC for compatibility with header check)
+	// We calculate CRC over [Size][SeqID][Payload] just like before
+	// The buffer contains [CRC][Size][SeqID][Payload][Footer]
+	// CRC is stored at buf[0:4]. It covers buf[4 : headerSize+len(payload)]
+
+	checksum := calculateCRC(buf[crcSize : headerSize+len(payload)])
 	binary.BigEndian.PutUint32(buf[:crcSize], checksum)
 
 	if _, err := w.activeSegment.writer.Write(buf); err != nil {
@@ -439,7 +546,7 @@ func (w *WAL) Write(payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	pktSize := int64(headerSize + len(payload))
+	pktSize := int64(headerSize + len(payload) + footerSize)
 	if w.activeSegment.size+pktSize > w.segmentSize {
 		if err := w.createActiveSegment(w.activeSegment.idx + 1); err != nil {
 			return err
@@ -454,14 +561,13 @@ func (w *WAL) Write(payload []byte) error {
 }
 
 // WriteBatch writes a batch of entries to the WAL efficiently.
-// It acquires the lock once and syncs once (if needed) for the whole batch.
 func (w *WAL) WriteBatch(payloads [][]byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	var batchSize int64
 	for _, p := range payloads {
-		batchSize += int64(headerSize + len(p))
+		batchSize += int64(headerSize + len(p) + footerSize)
 	}
 
 	if w.activeSegment.size+batchSize > w.segmentSize {
@@ -480,7 +586,6 @@ func (w *WAL) WriteBatch(payloads [][]byte) error {
 }
 
 // sync: Flush buffer and fsync to disk
-// Internal method, caller must hold the lock
 func (w *WAL) sync() error {
 	if w.activeSegment == nil {
 		return nil
@@ -492,7 +597,6 @@ func (w *WAL) sync() error {
 }
 
 // Sync: Public method to sync data to disk
-// Caller does not need to hold the lock
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -518,7 +622,7 @@ func (w *WAL) Close() error {
 		w.mu.Unlock()
 		return err
 	}
-	w.mu.Unlock() // <--- IMPORTANT: Release the lock so that BackgroundSync can finish running (if it's stuck).
+	w.mu.Unlock()
 
 	w.StopSync()
 
@@ -539,8 +643,6 @@ func (w *WAL) GetLastSegmentIdx() uint64 {
 }
 
 // TruncateFront deletes all closed segments with an index less than the provided index.
-// This is used to free up disk space after a snapshot has been taken.
-// Note: This does not affect the active segment.
 func (w *WAL) TruncateFront(segmentIdx uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -548,9 +650,7 @@ func (w *WAL) TruncateFront(segmentIdx uint64) error {
 	var keptSegments []*Segment
 	for _, seg := range w.segments {
 		if seg.idx < segmentIdx {
-			// Remove the file from disk
 			if err := os.Remove(seg.path); err != nil {
-				// If the file is already gone, ignore the error
 				if !os.IsNotExist(err) {
 					return err
 				}
@@ -560,13 +660,11 @@ func (w *WAL) TruncateFront(segmentIdx uint64) error {
 		}
 	}
 
-	// Update the segment list
 	w.segments = keptSegments
 	return nil
 }
 
-// Cleanup removes closed segments that are older than the specified TTL (Time To Live).
-// This is useful for time-based retention policies.
+// Cleanup removes closed segments that are older than the specified TTL.
 func (w *WAL) CleanupByTTL(ttl time.Duration) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -575,19 +673,15 @@ func (w *WAL) CleanupByTTL(ttl time.Duration) error {
 	var keptSegments []*Segment
 
 	for _, seg := range w.segments {
-		// Get file stats to check modification time
 		info, err := os.Stat(seg.path)
 		if err != nil {
-			// If file doesn't exist, skip it (it's essentially cleaned)
 			if os.IsNotExist(err) {
 				continue
 			}
-			// If we can't stat it for some other reason, keep it to be safe
 			keptSegments = append(keptSegments, seg)
 			continue
 		}
 
-		// If the file is older than the threshold, delete it
 		if info.ModTime().Before(threshold) {
 			if err := os.Remove(seg.path); err != nil {
 				if !os.IsNotExist(err) {
@@ -604,7 +698,6 @@ func (w *WAL) CleanupByTTL(ttl time.Duration) error {
 }
 
 // CleanupBySize removes old segments if the total WAL size exceeds maxSizeBytes.
-// It deletes from the oldest segment until the total size is within the limit.
 func (w *WAL) CleanupBySize(maxSizeBytes int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
